@@ -10,6 +10,15 @@ import { useState, useEffect, useRef } from "react";
 */
 
 const STORAGE_KEY = "bingo-tracker-v2";
+const KEYS_KEY = "bingo-keys-v1";
+
+// Words excluded from keyword matching during news scan
+const STOP_WORDS = new Set([
+  "that","this","with","from","have","will","been","they","their",
+  "were","what","when","which","there","about","after","could","would",
+  "other","more","into","over","than","also","some","then","said",
+  "each","says","where","while","these","those","being","between",
+]);
 
 const EMPTY_SQUARES = () =>
   Array.from({ length: 25 }, (_, i) => ({
@@ -30,6 +39,81 @@ const DEFAULT_DATA = {
 
 const load = () => { try { const r = localStorage.getItem(STORAGE_KEY); return r ? JSON.parse(r) : null; } catch { return null; } };
 const save = (d) => { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(d)); } catch {} };
+
+const loadKeys = () => { try { return JSON.parse(localStorage.getItem(KEYS_KEY)) || {}; } catch { return {}; } };
+const saveKeys = (k) => { try { localStorage.setItem(KEYS_KEY, JSON.stringify(k)); } catch {} };
+
+// Robust JSON extraction — tolerates markdown fences and preamble text
+const extractJSON = (text) => {
+  const cleaned = text.replace(/```json|```/g, "").trim();
+  try { return JSON.parse(cleaned); } catch {}
+  const arr = cleaned.match(/\[[\s\S]*\]/);
+  if (arr) { try { return JSON.parse(arr[0]); } catch {} }
+  throw new Error("Couldn't read the card — try a clearer image.");
+};
+
+// ── Guardian API news search (free public API) ──
+// Batches all topics into OR-queries, then matches articles to squares via keyword scoring.
+const searchGuardian = async (topics, apiKey) => {
+  const key = apiKey?.trim() || "test";
+  const BATCH = 8;
+  const allResults = [];
+
+  for (let i = 0; i < topics.length; i += BATCH) {
+    const batch = topics.slice(i, i + BATCH);
+    const q = batch.map((t) => `"${t}"`).join(" OR ");
+    const url =
+      "https://content.guardianapis.com/search" +
+      `?q=${encodeURIComponent(q)}` +
+      "&show-fields=headline,trailText" +
+      "&order-by=newest&page-size=10" +
+      `&api-key=${encodeURIComponent(key)}`;
+
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      let msg = `Guardian API error (${resp.status})`;
+      try { const d = await resp.json(); if (d.message) msg = d.message; } catch {}
+      if (resp.status === 401) msg = "Invalid Guardian API key — check Settings.";
+      if (resp.status === 429) msg = "Rate limit hit — add your own free Guardian key in Settings.";
+      throw new Error(msg);
+    }
+    const data = await resp.json();
+
+    for (const article of data.response?.results || []) {
+      const headline = article.webTitle.toLowerCase();
+      const body = (article.fields?.trailText || "").toLowerCase().replace(/<[^>]+>/g, "");
+
+      let bestTopic = null;
+      let bestScore = 0;
+
+      for (const topic of batch) {
+        const words = topic
+          .toLowerCase()
+          .split(/[\s,\-\/]+/)
+          .filter((w) => w.length > 3 && !STOP_WORDS.has(w));
+        if (!words.length) continue;
+        const hits = words.filter((w) => headline.includes(w) || body.includes(w)).length;
+        const score = hits / words.length;
+        if (score > bestScore) { bestScore = score; bestTopic = topic; }
+      }
+
+      if (bestTopic && bestScore >= 0.4) {
+        allResults.push({
+          square_text: bestTopic,
+          headline: article.webTitle,
+          summary: (article.fields?.trailText || "").replace(/<[^>]+>/g, ""),
+          source: "The Guardian",
+          url: article.webUrl,
+          confidence: bestScore >= 0.8 ? "high" : bestScore >= 0.55 ? "medium" : "low",
+        });
+      }
+    }
+  }
+
+  // Keep first (highest-relevance) match per bingo square
+  const seen = new Set();
+  return allResults.filter((r) => !seen.has(r.square_text) && seen.add(r.square_text));
+};
 
 // ── Bingo logic ──
 function checkBingo(squares) {
@@ -95,6 +179,108 @@ const btnPrimary = { ...btnBase, background: "var(--accent)", color: "var(--bg)"
 const btnGhost = { ...btnBase, background: "transparent", color: "var(--text-dim)", padding: "9px 20px" };
 const btnSmall = { ...btnBase, background: "transparent", color: "var(--text-dim)", padding: "5px 12px", fontSize: "0.75rem" };
 
+// ── Settings Modal ──
+function SettingsModal({ isOpen, onClose }) {
+  const [anthropicKey, setAnthropicKey] = useState("");
+  const [guardianKey, setGuardianKey] = useState("");
+  const [saved, setSaved] = useState(false);
+
+  useEffect(() => {
+    if (isOpen) {
+      const k = loadKeys();
+      setAnthropicKey(k.anthropic || "");
+      setGuardianKey(k.guardian || "");
+      setSaved(false);
+    }
+  }, [isOpen]);
+
+  if (!isOpen) return null;
+
+  const handleSave = () => {
+    saveKeys({ anthropic: anthropicKey.trim(), guardian: guardianKey.trim() });
+    setSaved(true);
+    setTimeout(onClose, 700);
+  };
+
+  const inputStyle = {
+    width: "100%",
+    background: "var(--surface2)",
+    border: "1px solid var(--border)",
+    borderRadius: "var(--radius)",
+    padding: "9px 12px",
+    color: "var(--text)",
+    fontFamily: "monospace",
+    fontSize: "0.8rem",
+    marginBottom: 6,
+    outline: "none",
+  };
+  const labelStyle = {
+    fontFamily: "var(--sans)",
+    color: "var(--text-muted)",
+    fontSize: "0.7rem",
+    fontWeight: 500,
+    textTransform: "uppercase",
+    letterSpacing: "0.8px",
+    display: "block",
+    marginBottom: 6,
+  };
+  const hintStyle = {
+    fontFamily: "var(--sans)",
+    color: "var(--text-muted)",
+    fontSize: "0.72rem",
+    marginBottom: 22,
+    lineHeight: 1.55,
+  };
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 1001, display: "flex", alignItems: "center", justifyContent: "center", padding: 24, animation: "fadeIn 0.15s ease" }}>
+      <div onClick={(e) => e.stopPropagation()} style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", padding: 32, width: "100%", maxWidth: 440 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 28 }}>
+          <h3 style={{ fontFamily: "var(--serif)", color: "var(--text)", fontSize: "1.15rem", fontWeight: 400 }}>Settings</h3>
+          <button onClick={onClose} style={{ ...btnSmall, border: "none", color: "var(--text-muted)" }}>✕</button>
+        </div>
+
+        <label style={labelStyle}>Guardian API Key</label>
+        <input
+          value={guardianKey}
+          onChange={(e) => setGuardianKey(e.target.value)}
+          placeholder="Leave blank to use the free test key"
+          style={inputStyle}
+          autoComplete="off"
+          spellCheck={false}
+        />
+        <p style={hintStyle}>
+          Used for news scanning. Register free at{" "}
+          <span style={{ color: "var(--accent)" }}>open-platform.theguardian.com</span>
+          {" "}— or leave blank to use the shared test key (rate-limited).
+        </p>
+
+        <label style={labelStyle}>Anthropic API Key</label>
+        <input
+          type="password"
+          value={anthropicKey}
+          onChange={(e) => setAnthropicKey(e.target.value)}
+          placeholder="sk-ant-..."
+          style={inputStyle}
+          autoComplete="off"
+        />
+        <p style={hintStyle}>
+          Required only for uploading card images or PDFs. Not needed for manual entry or Guardian news scanning.
+        </p>
+
+        <div style={{ display: "flex", justifyContent: "flex-end" }}>
+          <button
+            onClick={handleSave}
+            style={saved ? { ...btnPrimary, background: "var(--green)", borderColor: "var(--green)" } : btnPrimary}
+          >
+            {saved ? "Saved" : "Save"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Upload Card Modal ──
 function UploadModal({ isOpen, onClose, onResult }) {
   const [uploading, setUploading] = useState(false);
@@ -106,6 +292,12 @@ function UploadModal({ isOpen, onClose, onResult }) {
   const toB64 = (f) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result.split(",")[1]); r.onerror = rej; r.readAsDataURL(f); });
 
   const process = async (file) => {
+    const keys = loadKeys();
+    if (!keys.anthropic) {
+      setError("An Anthropic API key is required for image reading. Add it in Settings.");
+      return;
+    }
+
     setUploading(true);
     setError("");
     setStatus("Reading file…");
@@ -134,23 +326,36 @@ function UploadModal({ isOpen, onClose, onResult }) {
 
       const resp = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1000, messages }),
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": keys.anthropic,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
+        body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 1000, messages }),
       });
+
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        const msg = err.error?.message || `API error (${resp.status})`;
+        if (resp.status === 401) throw new Error("Invalid Anthropic API key — check Settings.");
+        throw new Error(msg);
+      }
 
       const data = await resp.json();
       if (data.error) throw new Error(data.error.message);
 
       const text = data.content?.filter((c) => c.type === "text").map((c) => c.text).join("\n");
-      const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
+      if (!text) throw new Error("Empty response from API — try again.");
 
-      if (!Array.isArray(parsed) || parsed.length !== 25) throw new Error(`Expected 25 squares, got ${parsed?.length || 0}`);
+      const parsed = extractJSON(text);
+      if (!Array.isArray(parsed) || parsed.length !== 25) throw new Error(`Expected 25 squares, got ${parsed?.length ?? 0}.`);
 
       onResult(parsed.map((t, i) => (i === 12 ? "FREE SPACE" : String(t).trim())));
       setStatus("");
       onClose();
     } catch (e) {
-      setError(e.message.includes("JSON") ? "Couldn't parse the card — try a clearer image." : e.message);
+      setError(e.message || "Something went wrong. Please try again.");
     }
     setUploading(false);
   };
@@ -228,32 +433,16 @@ function ScanModal({ isOpen, onClose, onMatch, players }) {
     setStatus(`Scanning ${topics.length} topics…`);
 
     try {
-      const resp = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-20250514",
-          max_tokens: 1000,
-          tools: [{ type: "web_search_20250305", name: "web_search" }],
-          messages: [{
-            role: "user",
-            content: `You are a news matcher for a current events bingo game. Search recent news (last 7 days) matching ANY of these topics:\n\n${topics.map((t, i) => `${i + 1}. "${t}"`).join("\n")}\n\nRespond ONLY with a JSON array (no markdown, no preamble). Each element: {"square_text": "exact bingo text", "headline": "...", "summary": "1-2 sentences", "source": "...", "confidence": "high"|"medium"|"low"}\n\nNo matches? Return []`,
-          }],
-        }),
-      });
-
-      const data = await resp.json();
-      const text = data.content?.filter((c) => c.type === "text").map((c) => c.text).join("\n");
-
-      if (text) {
-        const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
-        setResults(Array.isArray(parsed) ? parsed : []);
-        setStatus(parsed.length ? `${parsed.length} match${parsed.length > 1 ? "es" : ""} found` : "No matches found.");
-      } else {
-        setStatus("No results.");
-      }
-    } catch {
-      setError("Connection failed.");
+      const keys = loadKeys();
+      const matches = await searchGuardian(topics, keys.guardian);
+      setResults(matches);
+      setStatus(
+        matches.length
+          ? `${matches.length} match${matches.length > 1 ? "es" : ""} found`
+          : "No matches in recent Guardian news."
+      );
+    } catch (e) {
+      setError(e.message || "Scan failed — check your connection and try again.");
     }
     setScanning(false);
   };
@@ -272,8 +461,11 @@ function ScanModal({ isOpen, onClose, onMatch, players }) {
 
         {!scanning && results.length === 0 && !status && (
           <div style={{ textAlign: "center", padding: "20px 0" }}>
-            <p style={{ fontFamily: "var(--sans)", color: "var(--text-dim)", fontSize: "0.85rem", marginBottom: 20 }}>
+            <p style={{ fontFamily: "var(--sans)", color: "var(--text-dim)", fontSize: "0.85rem", marginBottom: 8 }}>
               Search recent news for matches against your unmarked squares.
+            </p>
+            <p style={{ fontFamily: "var(--sans)", color: "var(--text-muted)", fontSize: "0.75rem", marginBottom: 20 }}>
+              Powered by The Guardian — free, no key required
             </p>
             <button onClick={scan} style={btnPrimary}>Scan now</button>
           </div>
@@ -286,7 +478,12 @@ function ScanModal({ isOpen, onClose, onMatch, players }) {
           </div>
         )}
 
-        {error && <p style={{ fontFamily: "var(--sans)", color: "var(--red)", fontSize: "0.8rem", textAlign: "center" }}>{error}</p>}
+        {error && (
+          <div style={{ textAlign: "center", padding: "20px 0" }}>
+            <p style={{ fontFamily: "var(--sans)", color: "var(--red)", fontSize: "0.8rem", marginBottom: 16 }}>{error}</p>
+            <button onClick={scan} style={btnGhost}>Try again</button>
+          </div>
+        )}
 
         {!scanning && status && results.length === 0 && !error && (
           <div style={{ textAlign: "center", padding: "20px 0" }}>
@@ -309,7 +506,11 @@ function ScanModal({ isOpen, onClose, onMatch, players }) {
                     <span style={{ fontFamily: "var(--sans)", fontSize: "0.7rem", color: "var(--text-muted)" }}>{r.source}</span>
                   </div>
                   <p style={{ fontFamily: "var(--sans)", color: "var(--text)", fontSize: "0.8rem", fontWeight: 500, marginBottom: 2 }}>{r.headline}</p>
-                  <p style={{ fontFamily: "var(--sans)", color: "var(--text-dim)", fontSize: "0.75rem", marginBottom: 4 }}>{r.summary}</p>
+                  {r.summary && (
+                    <p style={{ fontFamily: "var(--sans)", color: "var(--text-dim)", fontSize: "0.75rem", marginBottom: 4 }}>
+                      {r.summary.length > 150 ? r.summary.slice(0, 150) + "…" : r.summary}
+                    </p>
+                  )}
                   <p style={{ fontFamily: "var(--sans)", color: "var(--accent)", fontSize: "0.7rem" }}>→ {r.square_text}</p>
                 </div>
                 <button onClick={() => apply(r)} style={{ ...btnSmall, color: "var(--green)", borderColor: "rgba(108,191,132,0.25)", whiteSpace: "nowrap", flexShrink: 0 }}>Mark</button>
@@ -403,7 +604,7 @@ function Square({ sq, idx, winning, onToggle }) {
         position: "relative",
         aspectRatio: "1",
         background: winning ? "var(--accent-dim)" : sq.marked ? "rgba(255,255,255,0.04)" : "transparent",
-        border: winning ? "1px solid var(--accent-border)" : sq.aiSuggested && !sq.marked ? "1px solid rgba(107,163,190,0.3)" : "1px solid var(--border)",
+        border: winning ? "1px solid var(--accent-border)" : sq.aiSuggested ? "1px solid rgba(107,163,190,0.3)" : "1px solid var(--border)",
         borderRadius: "var(--radius)",
         cursor: isFree || empty ? "default" : "pointer",
         display: "flex",
@@ -414,13 +615,13 @@ function Square({ sq, idx, winning, onToggle }) {
         overflow: "hidden",
       }}
     >
-      {sq.aiSuggested && !sq.marked && (
+      {sq.aiSuggested && (
         <div style={{ position: "absolute", top: 4, right: 4, width: 5, height: 5, borderRadius: "50%", background: "var(--blue)" }} />
       )}
 
       <span style={{
         fontFamily: "var(--sans)",
-        fontSize: "clamp(0.5rem, 1.1vw, 0.7rem)",
+        fontSize: "clamp(0.6rem, 1.1vw, 0.72rem)",
         fontWeight: sq.marked ? 500 : 400,
         color: sq.marked ? "var(--accent)" : isFree ? "var(--text-muted)" : empty ? "var(--text-muted)" : "var(--text-dim)",
         textAlign: "center",
@@ -493,6 +694,7 @@ export default function App() {
   const [data, setData] = useState(() => load() || DEFAULT_DATA);
   const [editing, setEditing] = useState(null);
   const [scanOpen, setScanOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [tab, setTab] = useState(0);
 
   useEffect(() => { save(data); }, [data]);
@@ -514,7 +716,19 @@ export default function App() {
 
   const handleMatch = (r) => {
     setData((d) => {
-      const next = { ...d, players: d.players.map((p) => ({ ...p, card: { squares: p.card.squares.map((sq) => sq.text.toLowerCase() === r.square_text.toLowerCase() && !sq.marked ? { ...sq, aiSuggested: true, matchedArticle: `${r.headline} — ${r.source}` } : sq) } })) };
+      const next = {
+        ...d,
+        players: d.players.map((p) => ({
+          ...p,
+          card: {
+            squares: p.card.squares.map((sq) =>
+              sq.text.toLowerCase() === r.square_text.toLowerCase() && !sq.marked
+                ? { ...sq, marked: true, aiSuggested: true, matchedArticle: `${r.headline} — ${r.source}` }
+                : sq
+            ),
+          },
+        })),
+      };
       next.lastChecked = new Date().toISOString();
       return next;
     });
@@ -540,6 +754,7 @@ export default function App() {
           </div>
           <div style={{ display: "flex", gap: 8 }}>
             <button onClick={() => setScanOpen(true)} style={btnPrimary}>Scan news</button>
+            <button onClick={() => setSettingsOpen(true)} style={btnGhost}>Settings</button>
             <button onClick={reset} style={btnGhost}>Reset</button>
           </div>
         </div>
@@ -580,6 +795,7 @@ export default function App() {
       {/* Modals */}
       <EditModal isOpen={editing !== null} onClose={() => setEditing(null)} player={editing !== null ? data.players[editing] : null} onSave={(n, s) => saveCard(editing, n, s)} />
       <ScanModal isOpen={scanOpen} onClose={() => setScanOpen(false)} onMatch={handleMatch} players={data.players} />
+      <SettingsModal isOpen={settingsOpen} onClose={() => setSettingsOpen(false)} />
     </div>
   );
 }
