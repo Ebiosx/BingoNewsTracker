@@ -181,14 +181,14 @@ const btnSmall = { ...btnBase, background: "transparent", color: "var(--text-dim
 
 // ── Settings Modal ──
 function SettingsModal({ isOpen, onClose }) {
-  const [anthropicKey, setAnthropicKey] = useState("");
+  const [googleKey, setGoogleKey] = useState("");
   const [guardianKey, setGuardianKey] = useState("");
   const [saved, setSaved] = useState(false);
 
   useEffect(() => {
     if (isOpen) {
       const k = loadKeys();
-      setAnthropicKey(k.anthropic || "");
+      setGoogleKey(k.google || "");
       setGuardianKey(k.guardian || "");
       setSaved(false);
     }
@@ -197,7 +197,7 @@ function SettingsModal({ isOpen, onClose }) {
   if (!isOpen) return null;
 
   const handleSave = () => {
-    saveKeys({ anthropic: anthropicKey.trim(), guardian: guardianKey.trim() });
+    saveKeys({ google: googleKey.trim(), guardian: guardianKey.trim() });
     setSaved(true);
     setTimeout(onClose, 700);
   };
@@ -255,17 +255,19 @@ function SettingsModal({ isOpen, onClose }) {
           {" "}— or leave blank to use the shared test key (rate-limited).
         </p>
 
-        <label style={labelStyle}>Anthropic API Key</label>
+        <label style={labelStyle}>Google AI API Key</label>
         <input
           type="password"
-          value={anthropicKey}
-          onChange={(e) => setAnthropicKey(e.target.value)}
-          placeholder="sk-ant-..."
+          value={googleKey}
+          onChange={(e) => setGoogleKey(e.target.value)}
+          placeholder="AIza..."
           style={inputStyle}
           autoComplete="off"
         />
         <p style={hintStyle}>
-          Required only for uploading card images or PDFs. Not needed for manual entry or Guardian news scanning.
+          Used for card image/PDF reading (Gemini Flash). Get a free key at{" "}
+          <span style={{ color: "var(--accent)" }}>aistudio.google.com/apikey</span>
+          {" "}— no credit card required.
         </p>
 
         <div style={{ display: "flex", justifyContent: "flex-end" }}>
@@ -293,8 +295,8 @@ function UploadModal({ isOpen, onClose, onResult }) {
 
   const process = async (file) => {
     const keys = loadKeys();
-    if (!keys.anthropic) {
-      setError("An Anthropic API key is required for image reading. Add it in Settings.");
+    if (!keys.google) {
+      setError("A Google AI API key is required for image reading. Add it in Settings.");
       return;
     }
 
@@ -308,44 +310,41 @@ function UploadModal({ isOpen, onClose, onResult }) {
 
       const prompt = `You are a bingo card reader. Extract exactly 25 squares from this 5x5 bingo card, reading left-to-right, top-to-bottom. The center (position 13) is typically FREE SPACE. If you see B/I/N/G/O column headers, skip them — only extract square content. Respond ONLY with a JSON array of 25 strings. No markdown, no explanation.`;
 
-      let messages;
+      let parts;
       if (isImg) {
         setStatus("AI is reading the image…");
         const b64 = await toB64(file);
         const mt = file.type.includes("png") ? "image/png" : file.type.includes("webp") ? "image/webp" : file.type.includes("gif") ? "image/gif" : "image/jpeg";
-        messages = [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: mt, data: b64 } }, { type: "text", text: prompt }] }];
+        parts = [{ inline_data: { mime_type: mt, data: b64 } }, { text: prompt }];
       } else if (isPdf) {
         setStatus("AI is reading the PDF…");
         const b64 = await toB64(file);
-        messages = [{ role: "user", content: [{ type: "document", source: { type: "base64", media_type: "application/pdf", data: b64 } }, { type: "text", text: prompt }] }];
+        parts = [{ inline_data: { mime_type: "application/pdf", data: b64 } }, { text: prompt }];
       } else {
         setStatus("Parsing text…");
         const txt = await file.text();
-        messages = [{ role: "user", content: `${prompt}\n\nContent:\n${txt}` }];
+        parts = [{ text: `${prompt}\n\nContent:\n${txt}` }];
       }
 
-      const resp = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": keys.anthropic,
-          "anthropic-version": "2023-06-01",
-          "anthropic-dangerous-direct-browser-access": "true",
-        },
-        body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 1000, messages }),
-      });
+      const resp = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${encodeURIComponent(keys.google)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ contents: [{ parts }] }),
+        }
+      );
 
       if (!resp.ok) {
         const err = await resp.json().catch(() => ({}));
         const msg = err.error?.message || `API error (${resp.status})`;
-        if (resp.status === 401) throw new Error("Invalid Anthropic API key — check Settings.");
+        if (resp.status === 400) throw new Error(`Bad request: ${msg}`);
+        if (resp.status === 403) throw new Error("Invalid Google API key — check Settings.");
         throw new Error(msg);
       }
 
       const data = await resp.json();
-      if (data.error) throw new Error(data.error.message);
-
-      const text = data.content?.filter((c) => c.type === "text").map((c) => c.text).join("\n");
+      const text = data.candidates?.[0]?.content?.parts?.map((p) => p.text).filter(Boolean).join("\n");
       if (!text) throw new Error("Empty response from API — try again.");
 
       const parsed = extractJSON(text);
